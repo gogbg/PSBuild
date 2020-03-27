@@ -5,7 +5,7 @@ Import-Module -Name $modulePath -Force
 InModuleScope $moduleName {
     describe 'Build-PSModule' {
         it "test" {
-            Build-PSModule -Name module1 -InformationAction Continue
+            $r = Build-PSModule -Name module1 -InformationAction Continue -PassThru
         }
     }
 }
