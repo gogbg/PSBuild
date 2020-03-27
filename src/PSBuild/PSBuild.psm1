@@ -3,11 +3,11 @@
 function Invoke-PSBuildTask
 {
     [CmdletBinding()]
-    [OutputType([PSBuildContext])]
+    [OutputType([PSBuildWorkspace])]
     param
     (
         [Parameter(Mandatory)]
-        [PSBuildContext]$BuildContext,
+        [PSBuildWorkspace]$BuildContext,
 
         [Parameter(Mandatory)]
         [ValidateSet('OnBegin','OnProcess','OnEnd')]
@@ -76,17 +76,16 @@ function Build-PSModule
         #$psbuildModuleBase = $psbuildModule.ModuleBase
 
         #Initialize module context
-        $moduleContexts = [System.Collections.Generic.List[PSBuildContext]]::new()
+        $moduleContexts = [System.Collections.Generic.List[PSBuildWorkspace]]::new()
         foreach ($dm in $script:discoveredModules)
         {
-            $moduleBuildFactory = [PSBuildFactory]::New()
-            $moduleContexts.Add($moduleBuildFactory.NewBuildContext($dm.Name, $dm.FolderPath, $script:defaultModuleBuildTasks))
+            $moduleContexts.Add([PSBuildFactory]::NewBuildWorkspace($dm.Name, $dm.FolderPath, $script:defaultModuleBuildTasks,[PSBuildDefaultTaskRunner],[PSBuildModuleContext]))
         }
 
         foreach ($mc in $moduleContexts)
         {
             #Execute OnBegin
-            $mc.TaskRunner.RunTasks($mc,[PSBuildTaskMethod]::OnBegin)
+            $mc.TaskRunner::RunTasks($mc,[PSBuildTaskMethod]::OnBegin)
             #$mc = Invoke-PSBuildTask -BuildContext $mc -Method OnBegin
         }
     }
@@ -98,7 +97,7 @@ function Build-PSModule
             #Import-Module -Name $Using:psbuildModuleBase -Force
 
             #Execute OnProcess
-            $_.TaskRunner.RunTasks($_,[PSBuildTaskMethod]::OnProcess)
+            $_.TaskRunner::RunTasks($_,[PSBuildTaskMethod]::OnProcess)
             #$_ = Invoke-PSBuildTask -BuildContext $_ -Method OnProcess
         }
     }
@@ -107,17 +106,18 @@ function Build-PSModule
         foreach ($mc in $moduleContexts)
         {
             #Execute OnEnd
-            $mc.TaskRunner.RunTasks($mc,[PSBuildTaskMethod]::OnEnd)
+            $mc.TaskRunner::RunTasks($mc,[PSBuildTaskMethod]::OnEnd)
             #$mc = Invoke-PSBuildTask -BuildContext $mc -Method OnEnd
         }
 
         #return result
         if ($PassThru.IsPresent)
         {
-            $moduleContexts.ModuleInfo
+            $moduleContexts.Context
         }
     }
 }
+
 function Find-PSModuleDefinition
 {
     [cmdletbinding()]
@@ -149,10 +149,11 @@ $defaultModuleBuildTasks = @(
 #endregion
 
 #region base classes
-class PSBuildContext
+class PSBuildWorkspace
 {
     [System.Collections.Generic.List[PSBuildTask]]$Tasks = ([System.Collections.Generic.List[PSBuildTask]]::new())
     [PSBuildTaskRunnerBase]$TaskRunner
+    [PSBuildContextBase]$Context
 }
 
 class PSBuildTask
@@ -162,24 +163,27 @@ class PSBuildTask
     [type]$Type
 }
 
-class PSBuildInfoBase
+class PSBuildContextBase
 {
-
+    [string]$Name
+    [string]$FolderPath
 }
 
 class PSBuildTaskBase
 {
-    [PSBuildInfoBase]OnBegin([PSBuildInfoBase]$buildInfo)
+    static [string]$Name
+
+    [PSBuildContextBase]OnBegin([PSBuildContextBase]$context)
     {
         throw 'Not implemented'
     }
 
-    [PSBuildInfoBase]OnProcess([PSBuildInfoBase]$buildInfo)
+    [PSBuildContextBase]OnProcess([PSBuildContextBase]$context)
     {
         throw 'Not implemented'
     }
 
-    [PSBuildInfoBase]OnEnd([PSBuildInfoBase]$buildInfo)
+    [PSBuildContextBase]OnEnd([PSBuildContextBase]$context)
     {
         throw 'Not implemented'
     }
@@ -197,81 +201,67 @@ class PSBuildTaskBase
 
 class PSBuildTaskRunnerBase
 {
-    static [void]RunTasks([PSBuildContext]$buildContext,[PSBuildTaskMethod]$method) {
+    static [void]RunTasks([PSBuildWorkspace]$buildContext,[PSBuildTaskMethod]$method) {
         throw "Not implemented"
     }
 }
 
 class PSBuildFactory
 {
-    static [type]$DefaultTaskRunner = [PSBuildDefaultTaskRunner]
-
-    [PSBuildContext]NewBuildContext([string]$name, [string]$folderPath, [System.Collections.Generic.List[string]]$tasks)
+    static [PSBuildWorkspace]NewBuildWorkspace([string]$name, [string]$folderPath, [System.Collections.Generic.List[string]]$tasks, [type]$taskRunnerType, [type]$contextType)
     {
-        #Initialize taskRunner
-        $taskRunner = $this::DefaultTaskRunner::new()
-
-        return $this.NewBuildContext($name,$folderPath,$tasks,$taskRunner)
-    }
-
-    [PSBuildContext]NewBuildContext([string]$name, [string]$folderPath, [System.Collections.Generic.List[string]]$tasks, [PSBuildTaskRunnerBase]$taskRunner)
-    {
-        $result = [PSBuildContext]::new()
-        $result.TaskRunner = $taskRunner
-        $result.ModuleInfo = [PSBuildInfoBase]::new()
-        $result.ModuleInfo.Name = $name
-        $result.ModuleInfo.FolderPath = $folderPath
+        $result = [PSBuildWorkspace]::new()
+        $result.TaskRunner = $taskRunnerType::new()
         foreach ($t in $tasks)
         {
-            $result.Tasks.Add($this.NewBuildTask($t))
+            $result.Tasks.Add([PSBuildFactory]::NewBuildTask($t))
         }
 
-        $result.TaskRunner.BuildContext = $result
+        $result.Context = $contextType::new()
+        $result.Context.Name = $name
+        $result.Context.FolderPath = $folderPath
+
         return $result
     }
 
-    [PSBuildTask]NewBuildTask([string]$name)
+    static [PSBuildTask]NewBuildTask([string]$type)
     {
         $result = [PSBuildTask]::New()
-        $result.Name = $name
-        $type = $name -as [type]
-        if (-not $type)
+
+        #check if build task type exist
+        $typeExist = $type -as [type]
+        if (-not $typeExist)
         {
-            throw "task: $name not found"
+            throw "task: $type not found"
         }
 
-        $result.Type = $type
+        $result.Name = $typeExist::Name
+        $result.Type = $typeExist
         return $result
     }
 }
 #endregion
 
 #region module classes
-class PSModuleBuildInfo : PSBuildInfoBase
+class PSBuildModuleContext : PSBuildContextBase
 {
-    [string]$FolderPath
-    [string]$Name
     [string]$Version
     [string]$Functions
 }
 
-class PSModuleBuildContext : PSBuildContext
-{
-    [PSModuleBuildInfo]$ModuleInfo = [PSModuleBuildInfo]::new()
-}
 #endregion
 
 #region buildTaskRunners
 class PSBuildDefaultTaskRunner : PSBuildTaskRunnerBase
 {
-    static [void]RunTasks([PSBuildContext]$buildContext,[PSBuildTaskMethod]$method) {
+    static [void]RunTasks([PSBuildWorkspace]$buildContext,[PSBuildTaskMethod]$method) {
         foreach ($task in $buildContext.Tasks)
         {
-            $taskMethod = $task.Type.GetMethod($method)
+            $taskMethod = $task.Type.GetMethods() | Where-Object {$_.DeclaringType -eq $task.Type -and $_.Name -eq $method.ToString()}
             if ($taskMethod)
             {
                 $taskInstance = $task.Type::new()
-                $buildContext.ModuleInfo = $taskInstance."$method"($buildContext.ModuleInfo)
+                $buildContext.Context = $taskInstance."$method"($buildContext.Context)
             }
         }
     }
@@ -281,25 +271,27 @@ class PSBuildDefaultTaskRunner : PSBuildTaskRunnerBase
 #region buildTasks
 class PSModuleBuildTaskGetVersion : PSBuildTaskBase
 {
-    [PSModuleBuildInfo]OnBegin([PSModuleBuildInfo]$buildInfo)
+    static [string]$Name = 'GetVersion'
+
+    [PSBuildModuleContext]OnBegin([PSBuildModuleContext]$context)
     {
         $this.WriteWarning('Info from OnBegin')
-        return $buildInfo
+        return $context
     }
 
-    [PSModuleBuildInfo]OnProcess([PSModuleBuildInfo]$buildInfo)
+    [PSBuildModuleContext]OnProcess([PSBuildModuleContext]$context)
     {
-        $manifestPath = Join-Path -Path $buildInfo.FolderPath -ChildPath "$($buildInfo.Name).psbuild.psd1"
+        $manifestPath = Join-Path -Path $context.FolderPath -ChildPath "$($context.Name).psbuild.psd1"
         $manifest = Test-ModuleManifest -Path $manifestPath
-        $buildInfo.Version = $manifest.Version
+        $context.Version = $manifest.Version
         $this.WriteWarning('Info from OnProcess')
-        return $buildInfo
+        return $context
     }
 
-    [PSModuleBuildInfo]OnEnd([PSModuleBuildInfo]$buildInfo)
+    [PSBuildModuleContext]OnEnd([PSBuildModuleContext]$context)
     {
         $this.WriteWarning('Info from OnEnd')
-        return $buildInfo
+        return $context
     }
 }
 #endregion
