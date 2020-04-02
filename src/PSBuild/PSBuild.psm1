@@ -41,11 +41,6 @@ function Build-PSModule
     begin
     {
         $taskRunner = [PSBuildDefaultTaskRunner]
-
-        #Get PSBuild module
-        $psbuildModule = Get-Module -Name PSBuild
-        $psbuildModulePath = $psbuildModule.Path
-        #$psbuildModuleBase = $psbuildModule.ModuleBase
     }
     process
     {
@@ -60,18 +55,21 @@ function Build-PSModule
         #Execute OnBegin
         $taskRunner::RunTasks($workspaces,[PSBuildTaskMethod]::OnBegin)
 
-        $workspaces | ForEach-Object -Parallel {
-            $taskRunner = $Using:taskRunner
-
-            #Load classes from psbuild module
-            Invoke-Expression -command "using module $Using:psbuildModulePath"
-
-            #Execute OnProcess
-            $taskRunner::RunTasks($_,[PSBuildTaskMethod]::OnProcess)
-        }
+        #Execute OnProcess
+        $taskRunner::RunTasks($workspaces,[PSBuildTaskMethod]::OnProcess)
 
         #Execute OnEnd
         $taskRunner::RunTasks($workspaces,[PSBuildTaskMethod]::OnEnd)
+
+        # $workspaces | ForEach-Object -Parallel {
+        #     $taskRunner = $Using:taskRunner
+
+        #     #Load classes from psbuild module
+        #     Invoke-Expression -command "using module $Using:psbuildModulePath"
+
+        #     #Execute OnProcess
+        #     $taskRunner::RunTasks($_,[PSBuildTaskMethod]::OnProcess)
+        # }
     }
     end
     {
@@ -165,7 +163,7 @@ class PSBuildTaskBase
     
     [void]WriteInformation([string]$message)
     {
-        $This.Workspace.Logs.Add([PSBuildLogEntry]@{
+        $This.Logs.Add([PSBuildLogEntry]@{
             Timestamp=Get-Date
             Source=$this::Name
             Type='Information'
@@ -176,7 +174,7 @@ class PSBuildTaskBase
 
     [void]WriteWarning([string]$message)
     {
-        $This.Workspace.Logs.Add([PSBuildLogEntry]@{
+        $This.Logs.Add([PSBuildLogEntry]@{
             Timestamp=Get-Date
             Source=$this::Name
             Type='Warning'
@@ -187,7 +185,7 @@ class PSBuildTaskBase
 
     [void]WriteError([string]$message)
     {
-        $This.Workspace.Logs.Add([PSBuildLogEntry]@{
+        $This.Logs.Add([PSBuildLogEntry]@{
             Timestamp=Get-Date
             Source=$this::Name
             Type='Error'
@@ -252,30 +250,84 @@ class PSBuildModuleContext : PSBuildContextBase
 class PSBuildDefaultTaskRunner : PSBuildTaskRunnerBase
 {
     static [void]RunTasks([System.Collections.Generic.List[PSBuildWorkspace]]$workspaces,[PSBuildTaskMethod]$method) {
-        foreach ($workspace in $workspaces)
-        {
-            if ($workspace.State -eq [PSBuildWorkspaceState]::Available)
-            {
-                foreach ($task in $workspace.Tasks)
+        switch ($method) {
+            {$_ -in [PSBuildTaskMethod]::OnBegin,[PSBuildTaskMethod]::OnEnd} {
+                foreach ($workspace in $workspaces)
                 {
-                    $taskMethod = $task.Type.GetMethods() | Where-Object {$_.DeclaringType -eq $task.Type -and $_.Name -eq $method.ToString()}
-                    if ($taskMethod)
+                    foreach ($task in $workspace.Tasks)
                     {
-                        $taskInstance = $task.Type::new()
-                        Add-Member -InputObject $taskInstance -MemberType NoteProperty -Name Workspace -TypeName PSBuildWorkspace -Value $workspace
-                        $taskInstance.Context = $workspace.Context
-                        try
+                        if ($workspace.State -eq [PSBuildWorkspaceState]::Available)
                         {
-                            $taskInstance.Workspace.State = [PSBuildWorkspaceState]::Busy
-                            $taskInstance."$method"()
-                            $taskInstance.Workspace.State = [PSBuildWorkspaceState]::Available
-                        }
-                        catch
-                        {
-                            $taskInstance.Workspace.State = [PSBuildWorkspaceState]::Failed
+                            try
+                            {
+                                $workspace.State = [PSBuildWorkspaceState]::Busy
+                                [PSBuildDefaultTaskRunner]::RunTask($task,$method,$workspace.Context,$workspace.Logs)
+                                $workspace.State = [PSBuildWorkspaceState]::Available
+                            }
+                            catch
+                            {
+                                $workspace.State = [PSBuildWorkspaceState]::Failed
+                            }
                         }
                     }
                 }
+
+                break
+            }
+
+            {$_ -eq [PSBuildTaskMethod]::OnProcess} {
+                $AllJobs = [System.Collections.Generic.List[System.Management.Automation.Job]]::new()
+                $ThisFilePath = $PSCommandPath
+                foreach ($workspace in $workspaces)
+                {
+                    Start-Job -ScriptBlock {
+                        Invoke-Expression "using module $Using:ThisFilePath"
+                        $ws = $Using:workspace
+                        foreach ($task in $ws.Tasks)
+                        {
+                            if ($ws.State -eq [PSBuildWorkspaceState]::Available)
+                            {
+                                try
+                                {
+                                    $ws.State = [PSBuildWorkspaceState]::Busy
+                                    [PSBuildDefaultTaskRunner]::RunTask($task,$method,$ws.Context,$ws.Logs)
+                                    $ws.State = [PSBuildWorkspaceState]::Available
+                                }
+                                catch
+                                {
+                                    $ws.State = [PSBuildWorkspaceState]::Failed
+                                }
+                            }
+                        }
+
+                        #return workspace
+                        $ws
+                    } | ForEach-Object -Process {
+                        $AllJobs.Add($_)
+                    }
+                }
+
+                $r = $AllJobs | Wait-Job | Receive-Job
+                break
+            }
+        }
+    }
+
+    static [void]RunTask([PSBuildTask]$task,[PSBuildTaskMethod]$method,[PSBuildContextBase]$context,[System.Collections.Generic.List[PSBuildLogEntry]]$Logs)
+    {
+        $taskMethod = $task.Type.GetMethods() | Where-Object {$_.DeclaringType -eq $task.Type -and $_.Name -eq $method.ToString()}
+        if ($taskMethod)
+        {
+            $taskInstance = $task.Type::new()
+            Add-Member -InputObject $taskInstance -MemberType NoteProperty -Name Logs -TypeName PSBuildWorkspace -Value $Logs
+            $taskInstance.Context = $context
+            try
+            {
+                $taskInstance."$method"()
+            }
+            catch
+            {
+                $taskInstance.Workspace.State = [PSBuildWorkspaceState]::Failed
             }
         }
     }
@@ -290,14 +342,14 @@ class PSModuleBuildTaskGetVersion : PSBuildTaskBase
     [void]OnBegin()
     {
         $this.WriteWarning('Info from OnBegin')
+        $manifestPath = Join-Path -Path $This.Context.FolderPath -ChildPath "$($This.Context.Name).psbuild.psd1"
+        $manifest = Test-ModuleManifest -Path $manifestPath
+        $This.Context.Version = $manifest.Version
     }
 
     [void]OnProcess()
     {
         $this.WriteWarning('Info from OnProcess')
-        $manifestPath = Join-Path -Path $This.Context.FolderPath -ChildPath "$($This.Context.Name).psbuild.psd1"
-        $manifest = Test-ModuleManifest -Path $manifestPath
-        $This.Context.Version = $manifest.Version
     }
 
     [void]OnEnd()
