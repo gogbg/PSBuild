@@ -44,7 +44,6 @@ function Build-PSModule
     }
     process
     {
-
         #Initialize module context
         $workspaces = [System.Collections.Generic.List[PSBuildWorkspace]]::new()
         foreach ($dm in $script:discoveredModules)
@@ -60,16 +59,6 @@ function Build-PSModule
 
         #Execute OnEnd
         $taskRunner::RunTasks($workspaces,[PSBuildTaskMethod]::OnEnd)
-
-        # $workspaces | ForEach-Object -Parallel {
-        #     $taskRunner = $Using:taskRunner
-
-        #     #Load classes from psbuild module
-        #     Invoke-Expression -command "using module $Using:psbuildModulePath"
-
-        #     #Execute OnProcess
-        #     $taskRunner::RunTasks($_,[PSBuildTaskMethod]::OnProcess)
-        # }
     }
     end
     {
@@ -115,7 +104,6 @@ $defaultModuleBuildTasks = @(
 class PSBuildWorkspace
 {
     [System.Collections.Generic.List[PSBuildTask]]$Tasks = ([System.Collections.Generic.List[PSBuildTask]]::new())
-    [PSBuildTaskRunnerBase]$TaskRunner
     [PSBuildContextBase]$Context
     [PSBuildWorkspaceState]$State = [PSBuildWorkspaceState]::Available
     [System.Collections.Generic.List[PSBuildLogEntry]]$Logs = [System.Collections.Generic.List[PSBuildLogEntry]]::new()
@@ -132,7 +120,7 @@ class PSBuildLogEntry
 class PSBuildTask
 {
     [string]$Name
-    [type]$Type
+    [string]$Type
 }
 
 class PSBuildContextBase
@@ -231,7 +219,35 @@ class PSBuildFactory
         }
 
         $result.Name = $typeExist::Name
-        $result.Type = $typeExist
+        $result.Type = $type
+        return $result
+    }
+
+    static [string]SerializeWorkspace([PSBuildWorkspace]$workspace)
+    {
+        return (@{
+            Types=@{
+                Context=$workspace.Context.GetType().FullName
+                State=$workspace.State.GetType().FullName
+                Logs='PSBuildLogEntry'
+                Tasks='PSBuildTask'
+            }
+            Value=$workspace
+        } | ConvertTo-Json -Compress -Depth 10)
+    }
+
+    static [PSBuildWorkspace]DeserializeWorkspace([string]$workspace)
+    {
+        $deserializedWorkspace = $workspace | ConvertFrom-Json
+        $result = [PSBuildWorkspace]::new()
+        $result.Context = $deserializedWorkspace.Value.Context -as $deserializedWorkspace.Types.Context
+        $result.State = $deserializedWorkspace.Value.State -as $deserializedWorkspace.Types.State
+        $deserializedWorkspace.Value.Logs | ForEach-Object -Process {
+            $result.Logs.Add(($_ -as $deserializedWorkspace.Types.Logs))
+        }
+        $deserializedWorkspace.Value.Tasks | ForEach-Object -Process {
+            $result.Tasks.Add(($_ -as $deserializedWorkspace.Types.Tasks))
+        }
         return $result
     }
 }
@@ -249,7 +265,8 @@ class PSBuildModuleContext : PSBuildContextBase
 #region buildTaskRunners
 class PSBuildDefaultTaskRunner : PSBuildTaskRunnerBase
 {
-    static [void]RunTasks([System.Collections.Generic.List[PSBuildWorkspace]]$workspaces,[PSBuildTaskMethod]$method) {
+    static [void]RunTasks([System.Collections.Generic.List[PSBuildWorkspace]]$workspaces,[PSBuildTaskMethod]$method) 
+    {
         switch ($method) {
             {$_ -in [PSBuildTaskMethod]::OnBegin,[PSBuildTaskMethod]::OnEnd} {
                 foreach ($workspace in $workspaces)
@@ -276,13 +293,15 @@ class PSBuildDefaultTaskRunner : PSBuildTaskRunnerBase
             }
 
             {$_ -eq [PSBuildTaskMethod]::OnProcess} {
-                $AllJobs = [System.Collections.Generic.List[System.Management.Automation.Job]]::new()
-                $ThisFilePath = $PSCommandPath
-                foreach ($workspace in $workspaces)
+                $allJobs = [System.Collections.Generic.List[System.Management.Automation.Job]]::new()
+                $thisFilePath = $PSCommandPath
+                $invocationId = (New-Guid).Guid
+                for ($wid=0;$wid -lt $workspaces.Count; $wid++)
                 {
-                    Start-Job -ScriptBlock {
-                        Invoke-Expression "using module $Using:ThisFilePath"
-                        $ws = $Using:workspace
+                    $serializedWorkspace = [PSBuildFactory]::SerializeWorkspace($workspaces[$wid])
+                    Start-Job -Name "$invocationId-ws-$wid" -ScriptBlock {
+                        Invoke-Expression "using module $Using:thisFilePath"
+                        $ws = [PSBuildFactory]::DeserializeWorkspace($Using:serializedWorkspace)
                         foreach ($task in $ws.Tasks)
                         {
                             if ($ws.State -eq [PSBuildWorkspaceState]::Available)
@@ -290,7 +309,7 @@ class PSBuildDefaultTaskRunner : PSBuildTaskRunnerBase
                                 try
                                 {
                                     $ws.State = [PSBuildWorkspaceState]::Busy
-                                    [PSBuildDefaultTaskRunner]::RunTask($task,$method,$ws.Context,$ws.Logs)
+                                    [PSBuildDefaultTaskRunner]::RunTask($task,$using:method,$ws.Context,$ws.Logs)
                                     $ws.State = [PSBuildWorkspaceState]::Available
                                 }
                                 catch
@@ -301,13 +320,24 @@ class PSBuildDefaultTaskRunner : PSBuildTaskRunnerBase
                         }
 
                         #return workspace
-                        $ws
+                        [PSBuildFactory]::SerializeWorkspace($ws)
                     } | ForEach-Object -Process {
-                        $AllJobs.Add($_)
+                        $allJobs.Add($_)
                     }
                 }
 
-                $r = $AllJobs | Wait-Job | Receive-Job
+                $allJobs | Wait-Job | ForEach-Object {
+                    $wid = $_.Name.Replace("$invocationId-ws-",'')
+                    try
+                    {
+                        $result = [PSBuildFactory]::DeserializeWorkspace((Receive-Job -Job $_))
+                        $workspaces[$wid] = $result
+                    }
+                    catch
+                    {
+                        $workspaces[$wid].State = [PSBuildWorkspaceState]::Failed
+                    }
+                }
                 break
             }
         }
@@ -315,10 +345,11 @@ class PSBuildDefaultTaskRunner : PSBuildTaskRunnerBase
 
     static [void]RunTask([PSBuildTask]$task,[PSBuildTaskMethod]$method,[PSBuildContextBase]$context,[System.Collections.Generic.List[PSBuildLogEntry]]$Logs)
     {
-        $taskMethod = $task.Type.GetMethods() | Where-Object {$_.DeclaringType -eq $task.Type -and $_.Name -eq $method.ToString()}
+        $taskType = $task.Type -as [type]
+        $taskMethod = $taskType.GetMethods() | Where-Object {$_.DeclaringType -eq $taskType -and $_.Name -eq $method.ToString()}
         if ($taskMethod)
         {
-            $taskInstance = $task.Type::new()
+            $taskInstance = $taskType::new()
             Add-Member -InputObject $taskInstance -MemberType NoteProperty -Name Logs -TypeName PSBuildWorkspace -Value $Logs
             $taskInstance.Context = $context
             try
@@ -350,6 +381,7 @@ class PSModuleBuildTaskGetVersion : PSBuildTaskBase
     [void]OnProcess()
     {
         $this.WriteWarning('Info from OnProcess')
+        
     }
 
     [void]OnEnd()
