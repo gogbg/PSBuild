@@ -158,7 +158,7 @@ class PSBuildTaskBase
             Type='Information'
             Message=$message
         })
-        Write-Information -MessageData $message
+        Write-Information -MessageData "$($this::Name): ${message}"
     }
 
     [void]WriteWarning([string]$message)
@@ -169,7 +169,7 @@ class PSBuildTaskBase
             Type='Warning'
             Message=$message
         })
-        Write-Warning -Message $message
+        Write-Warning -Message "$($this::Name): ${message}"
     }
 
     [void]WriteError([string]$message)
@@ -180,7 +180,7 @@ class PSBuildTaskBase
             Type='Error'
             Message=$message
         })
-        Write-Error -Message $message
+        Write-Error -Message "$($this::Name): ${message}"
     }
 }
 
