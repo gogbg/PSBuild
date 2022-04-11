@@ -1,4 +1,4 @@
 function Get-Something
 {
-'get-something'
+    'get-something'
 }

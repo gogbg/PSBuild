@@ -35,7 +35,10 @@ function Build-PSModule
         [string[]]$Name,
 
         [Parameter()]
-        [switch]$PassThru
+        [switch]$PassThru,
+
+        [Parameter()]
+        [PSBuildLogLevel]$LogLevel = 'Execution'
     )
     
     begin
@@ -48,17 +51,17 @@ function Build-PSModule
         $workspaces = [System.Collections.Generic.List[PSBuildWorkspace]]::new()
         foreach ($dm in $script:discoveredModules)
         {
-            $workspaces.Add([PSBuildFactory]::NewBuildWorkspace($dm.Name, $dm.FolderPath, $script:defaultModuleBuildTasks,[PSBuildModuleContext]))
+            $workspaces.Add([PSBuildFactory]::NewBuildWorkspace($dm.Name, $dm.FolderPath, $script:defaultModuleBuildTasks, $script:LogHanlderClass, $LogLevel, [PSBuildModuleContext]))
         }
 
         #Execute OnBegin
-        $taskRunner::RunTasks($workspaces,[PSBuildTaskMethod]::OnBegin)
+        $taskRunner::RunTasks($workspaces, [PSBuildTaskMethod]::OnBegin)
 
         #Execute OnProcess
-        $taskRunner::RunTasks($workspaces,[PSBuildTaskMethod]::OnProcess)
+        $taskRunner::RunTasks($workspaces, [PSBuildTaskMethod]::OnProcess)
 
         #Execute OnEnd
-        $taskRunner::RunTasks($workspaces,[PSBuildTaskMethod]::OnEnd)
+        $taskRunner::RunTasks($workspaces, [PSBuildTaskMethod]::OnEnd)
     }
     end
     {
@@ -95,18 +98,21 @@ function Find-PSModuleDefinition
 #region variables
 
 $defaultModuleBuildTasks = @(
-    'PSModuleBuildTaskGetVersion'
+    'PSModuleBuildTaskGetManifest'
+    "PSModuleBuildTaskGetPrivateFunctions"
 )
+
+$LogHanlderClass = 'PSBuildLogCollection'
 
 #endregion
 
 #region base classes
 class PSBuildWorkspace
 {
-    [System.Collections.Generic.List[PSBuildTask]]$Tasks = ([System.Collections.Generic.List[PSBuildTask]]::new())
+    [System.Collections.Generic.List[PSBuildTask]]$Tasks = [System.Collections.Generic.List[PSBuildTask]]::new()
     [PSBuildContextBase]$Context
     [PSBuildWorkspaceState]$State = [PSBuildWorkspaceState]::Available
-    [System.Collections.Generic.List[PSBuildLogEntry]]$Logs = [System.Collections.Generic.List[PSBuildLogEntry]]::new()
+    [PSBuildLogCollectionBase]$Logs
 }
 
 class PSBuildLogEntry
@@ -115,6 +121,90 @@ class PSBuildLogEntry
     [string]$Source
     [string]$Type
     [string]$Message
+}
+
+class PSBuildLogCollectionBase : System.Collections.Generic.List[object]
+{
+    [PSBuildLogLevel]$LogLevel
+    [void] AddExecution([string]$message, [string]$source)
+    {
+        throw 'Not implemented'
+    }
+    [void] AddInformation([string]$message, [string]$source)
+    {
+        throw 'Not implemented'
+    }
+    [void] AddWarning([string]$message, [string]$source)
+    {
+        throw 'Not implemented'
+    }
+    [void] AddError([string]$message, [string]$source)
+    {
+        throw 'Not implemented'
+    }
+}
+
+class PSBuildLogCollection : PSBuildLogCollectionBase
+{
+    [void] AddExecution([string]$message, [string]$source)
+    {
+        $this.Add([PSBuildLogEntry]@{
+                Timestamp = Get-Date
+                Source    = $source
+                Type      = 'Execution'
+                Message   = $message
+            })
+        if ($this.LogLevel.HasFlag([PSBuildLogLevel]::Execution))
+        {
+            Write-Information -MessageData "Execution: $source -> $message" -InformationAction Continue
+        }
+    }
+    [void] AddExecutionError([string]$message, [string]$source)
+    {
+        $this.Add([PSBuildLogEntry]@{
+                Timestamp = Get-Date
+                Source    = $source
+                Type      = 'Error'
+                Message   = $message
+            })
+        throw [PSBuildExecutionException]::new("$source -> $message")
+    }
+    [void] AddInformation([string]$message, [string]$source)
+    {
+        $this.Add([PSBuildLogEntry]@{
+                Timestamp = Get-Date
+                Source    = $source
+                Type      = 'Information'
+                Message   = $message
+            })
+        if ($this.LogLevel.HasFlag([PSBuildLogLevel]::Information))
+        {
+            Write-Information -MessageData "Information: $source -> $message" -InformationAction Continue
+        }
+    }
+    [void] AddWarning([string]$message, [string]$source)
+    {
+        $this.Add([PSBuildLogEntry]@{
+                Timestamp = Get-Date
+                Source    = $source
+                Type      = 'Warning'
+                Message   = $message
+            })
+        if ($this.LogLevel.HasFlag([PSBuildLogLevel]::Warning))
+        {
+            Write-Warning -Message "$source -> $message"
+        }
+    }
+    [void] AddError([string]$message, [string]$source)
+    {
+        $this.Add([PSBuildLogEntry]@{
+                Timestamp = Get-Date
+                Source    = $source
+                Type      = 'Error'
+                Message   = $message
+            })
+        throw [PSBuildTaskException]::new("$source -> $message")
+    }
 }
 
 class PSBuildTask
@@ -152,48 +242,31 @@ class PSBuildTaskBase
     
     [void]WriteInformation([string]$message)
     {
-        $This.Logs.Add([PSBuildLogEntry]@{
-            Timestamp=Get-Date
-            Source=$this::Name
-            Type='Information'
-            Message=$message
-        })
-        Write-Information -MessageData "$($this::Name): ${message}"
+        $This.Logs.AddInformation($message, $this::Name)
     }
 
     [void]WriteWarning([string]$message)
     {
-        $This.Logs.Add([PSBuildLogEntry]@{
-            Timestamp=Get-Date
-            Source=$this::Name
-            Type='Warning'
-            Message=$message
-        })
-        Write-Warning -Message "$($this::Name): ${message}"
+        $This.Logs.AddWarning($message, $this::Name)
     }
 
     [void]WriteError([string]$message)
     {
-        $This.Logs.Add([PSBuildLogEntry]@{
-            Timestamp=Get-Date
-            Source=$this::Name
-            Type='Error'
-            Message=$message
-        })
-        Write-Error -Message "$($this::Name): ${message}"
+        $This.Logs.AddError($message, $this::Name)
     }
 }
 
 class PSBuildTaskRunnerBase
 {
-    static [void]RunTasks([System.Collections.Generic.List[PSBuildWorkspace]]$workspaces,[PSBuildTaskMethod]$method) {
+    static [void]RunTasks([System.Collections.Generic.List[PSBuildWorkspace]]$workspaces, [PSBuildTaskMethod]$method)
+    {
         throw "Not implemented"
     }
 }
 
 class PSBuildFactory
 {
-    static [PSBuildWorkspace]NewBuildWorkspace([string]$name, [string]$folderPath, [System.Collections.Generic.List[string]]$tasks, [type]$contextType)
+    static [PSBuildWorkspace]NewBuildWorkspace([string]$name, [string]$folderPath, [System.Collections.Generic.List[string]]$tasks, [string]$logHanlderType, [PSBuildLogLevel]$logLevel, [type]$contextType)
     {
         $result = [PSBuildWorkspace]::new()
         foreach ($t in $tasks)
@@ -201,6 +274,8 @@ class PSBuildFactory
             $result.Tasks.Add([PSBuildFactory]::NewBuildTask($t))
         }
 
+        $result.Logs = New-Object -TypeName $logHanlderType -ErrorAction Stop
+        $result.Logs.LogLevel = $logLevel
         $result.Context = $contextType::new()
         $result.Context.Name = $name
         $result.Context.FolderPath = $folderPath
@@ -230,33 +305,21 @@ class PSBuildFactory
 
         return $result
     }
+}
 
-    static [string]SerializeWorkspace([PSBuildWorkspace]$workspace)
+class PSBuildTaskException : System.Exception
+{
+    PSBuildTaskException([string]$message): base($message)
     {
-        return (@{
-            Types=@{
-                Context=$workspace.Context.GetType().FullName
-                State=$workspace.State.GetType().FullName
-                Logs='PSBuildLogEntry'
-                Tasks='PSBuildTask'
-            }
-            Value=$workspace
-        } | ConvertTo-Json -Compress -Depth 10)
+
     }
+}
 
-    static [PSBuildWorkspace]DeserializeWorkspace([string]$workspace)
+class PSBuildExecutionException : System.Exception
+{
+    PSBuildExecutionException([string]$message): base($message)
     {
-        $deserializedWorkspace = $workspace | ConvertFrom-Json
-        $result = [PSBuildWorkspace]::new()
-        $result.Context = $deserializedWorkspace.Value.Context -as $deserializedWorkspace.Types.Context
-        $result.State = $deserializedWorkspace.Value.State -as $deserializedWorkspace.Types.State
-        $deserializedWorkspace.Value.Logs | ForEach-Object -Process {
-            $result.Logs.Add(($_ -as $deserializedWorkspace.Types.Logs))
-        }
-        $deserializedWorkspace.Value.Tasks | ForEach-Object -Process {
-            $result.Tasks.Add(($_ -as $deserializedWorkspace.Types.Tasks))
-        }
-        return $result
+
     }
 }
 #endregion
@@ -264,8 +327,17 @@ class PSBuildFactory
 #region module classes
 class PSBuildModuleContext : PSBuildContextBase
 {
-    [string]$Version
-    [string]$Functions
+    [hashtable]$Manifest
+    [System.Collections.Generic.Dictionary[string, PSBuildModuleFunction]]$PrivateFunctions = [System.Collections.Generic.Dictionary[string, PSBuildModuleFunction]]::new()
+    [System.Collections.Generic.Dictionary[string, PSBuildModuleFunction]]$PublicFUnctions = [System.Collections.Generic.Dictionary[string, PSBuildModuleFunction]]::new()
+}
+
+class PSBuildModuleFunction
+{
+    [string]$Name
+    [string]$Source
+    [System.Management.Automation.Language.Ast]$Ast
+    [string]$RelativeSource
 }
 
 #endregion
@@ -273,129 +345,150 @@ class PSBuildModuleContext : PSBuildContextBase
 #region buildTaskRunners
 class PSBuildDefaultTaskRunner : PSBuildTaskRunnerBase
 {
-    static [void]RunTasks([System.Collections.Generic.List[PSBuildWorkspace]]$workspaces,[PSBuildTaskMethod]$method) 
+    static [void]RunTasks([System.Collections.Generic.List[PSBuildWorkspace]]$workspaces, [PSBuildTaskMethod]$method) 
     {
-        switch ($method) {
-            {$_ -in [PSBuildTaskMethod]::OnBegin,[PSBuildTaskMethod]::OnEnd} {
-                foreach ($workspace in $workspaces)
+        foreach ($workspace in $workspaces)
+        {
+            foreach ($task in $workspace.Tasks)
+            {
+                if ($workspace.State -eq [PSBuildWorkspaceState]::Available)
                 {
-                    foreach ($task in $workspace.Tasks)
-                    {
-                        if ($workspace.State -eq [PSBuildWorkspaceState]::Available)
-                        {
-                            try
-                            {
-                                $workspace.State = [PSBuildWorkspaceState]::Busy
-                                [PSBuildDefaultTaskRunner]::RunTask($task,$method,$workspace.Context,$workspace.Logs)
-                                $workspace.State = [PSBuildWorkspaceState]::Available
-                            }
-                            catch
-                            {
-                                $workspace.State = [PSBuildWorkspaceState]::Failed
-                            }
-                        }
-                    }
-                }
-
-                break
-            }
-
-            {$_ -eq [PSBuildTaskMethod]::OnProcess} {
-                $allJobs = [System.Collections.Generic.List[System.Management.Automation.Job]]::new()
-                $thisFilePath = $PSCommandPath
-                $invocationId = (New-Guid).Guid
-                for ($wid=0;$wid -lt $workspaces.Count; $wid++)
-                {
-                    $serializedWorkspace = [PSBuildFactory]::SerializeWorkspace($workspaces[$wid])
-                    if ($workspaces[$wid].Tasks.ImplementedMethods -contains [PSBuildTaskMethod]::OnProcess)
-                    {
-                        Start-Job -Name "$invocationId-ws-$wid" -ScriptBlock {
-                            Invoke-Expression "using module $Using:thisFilePath"
-                            $ws = [PSBuildFactory]::DeserializeWorkspace($Using:serializedWorkspace)
-                            foreach ($task in $ws.Tasks)
-                            {
-                                if ($ws.State -eq [PSBuildWorkspaceState]::Available)
-                                {
-                                    try
-                                    {
-                                        $ws.State = [PSBuildWorkspaceState]::Busy
-                                        [PSBuildDefaultTaskRunner]::RunTask($task,$using:method,$ws.Context,$ws.Logs)
-                                        $ws.State = [PSBuildWorkspaceState]::Available
-                                    }
-                                    catch
-                                    {
-                                        $ws.State = [PSBuildWorkspaceState]::Failed
-                                    }
-                                }
-                            }
-
-                            #return workspace
-                            [PSBuildFactory]::SerializeWorkspace($ws)
-                        } | ForEach-Object -Process {
-                            $allJobs.Add($_)
-                        }
-                    }
-                }
-
-                $allJobs | Wait-Job | ForEach-Object {
-                    $wid = $_.Name.Replace("$invocationId-ws-",'')
                     try
                     {
-                        $result = [PSBuildFactory]::DeserializeWorkspace((Receive-Job -Job $_))
-                        $workspaces[$wid] = $result
+                        $workspace.State = [PSBuildWorkspaceState]::Busy
+                        [PSBuildDefaultTaskRunner]::RunTask($task, $method, $workspace.Context, $workspace.Logs)
+                        $workspace.State = [PSBuildWorkspaceState]::Available
                     }
                     catch
                     {
-                        $workspaces[$wid].State = [PSBuildWorkspaceState]::Failed
+                        $workspace.State = [PSBuildWorkspaceState]::Failed
+                        throw $_
                     }
                 }
-                break
             }
         }
     }
 
-    static [void]RunTask([PSBuildTask]$task,[PSBuildTaskMethod]$method,[PSBuildContextBase]$context,[System.Collections.Generic.List[PSBuildLogEntry]]$Logs)
+    static [void]RunTask([PSBuildTask]$task, [PSBuildTaskMethod]$method, [PSBuildContextBase]$context, [PSBuildLogCollectionBase]$Logs)
     {
-        
         if ($task.ImplementedMethods.Contains($method.ToString()))
         {
-            $taskInstance = New-Object -TypeName $task.Type
-            Add-Member -InputObject $taskInstance -MemberType NoteProperty -Name Logs -TypeName PSBuildWorkspace -Value $Logs
+            $taskInstance = New-Object -TypeName $task.Type -ErrorAction Stop
+            Add-Member -InputObject $taskInstance -MemberType NoteProperty -Name Logs -Value $Logs
             $taskInstance.Context = $context
             try
             {
+                $taskInstance.Logs.AddExecution('Starting', "$($taskInstance::Name)[$method]")
                 $taskInstance."$method"()
+                $taskInstance.Logs.AddExecution('Completed', "$($taskInstance::Name)[$method]")
+            }
+            catch [PSBuildTaskException]
+            {
+                throw $_
             }
             catch
             {
-                $taskInstance.Workspace.State = [PSBuildWorkspaceState]::Failed
+                $taskInstance.Logs.AddExecutionError('Failed', "$($taskInstance::Name)[$method]")
             }
+        }
+        else
+        {
+            $Logs.AddExecution('Skipped[not implemented]', "$($task.Name)[$method]")
         }
     }
 }
 #endregion
 
 #region buildTasks
-class PSModuleBuildTaskGetVersion : PSBuildTaskBase
+class PSModuleBuildTaskGetManifest : PSBuildTaskBase
 {
-    static [string]$Name = 'GetVersion'
+    static [string]$Name = 'GetManifest'
 
     [void]OnBegin()
     {
-        $this.WriteWarning('Info from OnBegin')
         $manifestPath = Join-Path -Path $This.Context.FolderPath -ChildPath "$($This.Context.Name).psbuild.psd1"
-        $manifest = Test-ModuleManifest -Path $manifestPath
-        $This.Context.Version = $manifest.Version
+        $this.Context.Manifest = Import-PowerShellDataFile -Path $manifestPath
+    }
+}
+
+class PSModuleBuildTaskGetPrivateFunctions : PSBuildTaskBase
+{
+    static [string]$Name = 'GetPrivateFunctions'
+
+    [void]AddFunctionToContext([PSBuildModuleFunction]$function)
+    {
+        if ($this.Context.PrivateFunctions.ContainsKey($function.Name))
+        {
+            $this.WriteError("Function: '$($function.Name)' in file: '$($function.RelativeSource)' is already defined in: '$($this.Context.PrivateFunctions[$function.Name].RelativeSource)'")
+        }
+        else
+        {
+            $this.Context.PrivateFunctions.Add($function.Name, $function)
+        }
     }
 
-    [void]OnProcess()
+    [System.Collections.Generic.List[PSBuildModuleFunction]]FindFunctions([string]$path, [string]$moduleRootFolder)
     {
-        $this.WriteWarning('Info from OnProcess')
+        $result = [System.Collections.Generic.List[PSBuildModuleFunction]]::new()
+        $getChildItemsParam = @{
+            Path    = Join-Path -Path $path -ChildPath '*'
+            File    = $true
+            Include = '*.psm1', '*.ps1'
+        }
+        $functionDefinitionFiles = Get-ChildItem @getChildItemsParam
+        foreach ($fdf in $functionDefinitionFiles)
+        {
+            $relativeSource = [System.IO.Path]::GetRelativePath($moduleRootFolder, $fdf.FullName)
+            switch ($fdf.Extension)
+            {
+                '.psm1'
+                {
+                    $codeBlock = [ScriptBlock]::Create([System.IO.File]::ReadAllText($fdf.FullName))
+                    $functionDefinitions = Get-AstStatement -Ast $codeBlock.Ast -Type FunctionDefinitionAst
+                    foreach ($fd in $functionDefinitions)
+                    {
+                        $result.Add([PSBuildModuleFunction]@{
+                                Name           = $fd.Name
+                                Ast            = $codeBlock.Ast
+                                Source         = $fdf.FullName
+                                RelativeSource = $relativeSource
+                            })
+                    }
+                    break
+                }
+
+                '.ps1'
+                {
+                    $codeBlock = [ScriptBlock]::Create([System.IO.File]::ReadAllText($fdf.FullName))
+                    $functionDefinition = Get-AstStatement -Ast $codeBlock.Ast -Type FunctionDefinitionAst
+                    if (($functionDefinition | Measure-Object).Count -gt 1)
+                    {
+                        $this.WriteError("File: '$relativeSource' contains more than one function definition")
+                    }
+                    $result.Add([PSBuildModuleFunction]@{
+                            Name           = $functionDefinition.Name
+                            Ast            = $codeBlock.Ast
+                            Source         = $fdf.FullName
+                            RelativeSource = $relativeSource
+                        })
+                    break
+                }
+            }
+        }
+        return $result
     }
 
-    [void]OnEnd()
+    [void]OnBegin()
     {
-        $this.WriteWarning('Info from OnEnd')
+        $privateFunctionsPath = Join-Path -Path $This.Context.FolderPath -ChildPath 'privateFunctions'
+        if (Test-Path -Path $privateFunctionsPath)
+        {
+            $funInPath = $this.FindFunctions($privateFunctionsPath, $this.Context.FolderPath)
+            foreach ($fip in $funInPath)
+            {
+                $this.AddFunctionToContext($fip)
+            }
+        }
     }
 }
 #endregion
@@ -417,4 +510,10 @@ enum PSBuildWorkspaceState
     Failed
 }
 
+[Flags()] enum PSBuildLogLevel
+{
+    Information = 2
+    Warning = 4
+    Execution = 8
+}
 #endregion

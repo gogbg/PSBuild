@@ -3,9 +3,13 @@ $modulePath = Split-Path -Path $PSScriptRoot | Join-Path -ChildPath 'src' -Addit
 Import-Module -Name $modulePath -Force
 
 InModuleScope $moduleName {
-    describe 'Build-PSModule' {
-        it "test" {
-            $r = Build-PSModule -Name module1 -InformationAction Continue -PassThru
+    Describe 'Build-PSModule' {
+        It "Should build module" {
+            $script:m = Build-PSModule -Name module1 -PassThru -LogLevel Execution, Information, Warning
+        }
+
+        It "Should find 2 private functions" {
+            $script:m.PrivateFunctions.Count | Should -BeExactly 2
         }
     }
 }
